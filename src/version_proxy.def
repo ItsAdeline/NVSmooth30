@@ -1,0 +1,19 @@
+LIBRARY version
+EXPORTS
+    GetFileVersionInfoA=nvs_GetFileVersionInfoA
+    GetFileVersionInfoByHandle=nvs_GetFileVersionInfoByHandle
+    GetFileVersionInfoExA=nvs_GetFileVersionInfoExA
+    GetFileVersionInfoExW=nvs_GetFileVersionInfoExW
+    GetFileVersionInfoSizeA=nvs_GetFileVersionInfoSizeA
+    GetFileVersionInfoSizeExA=nvs_GetFileVersionInfoSizeExA
+    GetFileVersionInfoSizeExW=nvs_GetFileVersionInfoSizeExW
+    GetFileVersionInfoSizeW=nvs_GetFileVersionInfoSizeW
+    GetFileVersionInfoW=nvs_GetFileVersionInfoW
+    VerFindFileA=nvs_VerFindFileA
+    VerFindFileW=nvs_VerFindFileW
+    VerInstallFileA=nvs_VerInstallFileA
+    VerInstallFileW=nvs_VerInstallFileW
+    VerLanguageNameA=nvs_VerLanguageNameA
+    VerLanguageNameW=nvs_VerLanguageNameW
+    VerQueryValueA=nvs_VerQueryValueA
+    VerQueryValueW=nvs_VerQueryValueW

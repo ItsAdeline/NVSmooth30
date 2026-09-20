@@ -1,0 +1,8 @@
+# Known structural fingerprint for the analysis reference only.
+# It is a regression fixture, not a runtime allowlist.
+sha256=cd395d58f41c6e393c31a9898f2be3da83f7bc109a2228935c23e8c89b944c15
+NVP_Init_D3D=+0x59e0
+gate_candidates=1 cmp_imm=+0xc41f,setge=+0xc437
+config=+0x7f0cd0
+fatbins=37 sm89_entries=37 sm120_entries=37
+
