@@ -5,6 +5,9 @@ running NVIDIA's `NvPresent64.dll` Smooth Motion path on SM86/RTX 30-series
 hardware. It is not NVIDIA software and contains no NVIDIA binaries or copied
 source code.
 
+##Download Release
+https://www.nexusmods.com/site/mods/2344
+
 ## Status and safety
 
 This is an **alpha interoperability project**. It was designed against the
