@@ -9,6 +9,11 @@ source code.
 
 https://www.nexusmods.com/site/mods/2344
 
+1. Extract the version.dll into the game folder with the executable (Rename the version.dll into a .asi if needed, use Ultimate ASI Loader only if using ASI).
+2. Download Nvidia Profile Inspector.
+3. Open up Nvidia Profile Inspector and enable Smooth motion for your game and hit "Apply Changes" (You will need to do this everytime your drivers are updated)
+4. Launch your game.
+
 ## Status and safety
 
 This is an **alpha interoperability project**. It was designed against the
