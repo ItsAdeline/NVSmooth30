@@ -105,6 +105,98 @@ def find_config(pe: PE, init_rva: int) -> int | None:
     return None
 
 
+RESOLVER_PREFIX = bytes.fromhex("48 83 ec 28 45 33 c9 48")
+IMAGE_SCN_MEM_EXECUTE = 0x20000000
+IMAGE_SCN_MEM_READ = 0x40000000
+IMAGE_SCN_MEM_WRITE = 0x80000000
+
+
+def section_for(pe: PE, rva: int, size: int = 1) -> Section | None:
+    for section in pe.sections:
+        if section.va <= rva and rva + size <= section.va + max(section.virtual_size, section.raw_size):
+            return section
+    return None
+
+
+def rel32(data: bytes, offset: int) -> int:
+    return struct.unpack_from("<i", data, offset)[0]
+
+
+def find_cudart_lazy_slot(pe: PE, symbol: str) -> tuple[int, int] | None:
+    """Mirror of nvpresent.cpp find_cudart_lazy_slot(): returns (resolver_rva, slot_rva)."""
+    needle = symbol.encode("ascii") + b"\0"
+    strings: set[int] = set()
+    for section in pe.sections:
+        if (section.characteristics & IMAGE_SCN_MEM_EXECUTE or
+                not section.characteristics & IMAGE_SCN_MEM_READ):
+            continue
+        blob = pe.data[section.raw_offset:section.raw_offset + section.raw_size]
+        cursor = 0
+        while (cursor := blob.find(needle, cursor)) >= 0:
+            if cursor == 0 or blob[cursor - 1] == 0:
+                strings.add(section.va + cursor)
+            cursor += 1
+    if not strings:
+        return None
+
+    def writable_data(rva: int) -> bool:
+        s = section_for(pe, rva, 8)
+        return bool(s and s.characteristics & IMAGE_SCN_MEM_WRITE and
+                    not s.characteristics & IMAGE_SCN_MEM_EXECUTE and rva % 8 == 0)
+
+    slots: set[int] = set()
+    exec_sections = [s for s in pe.sections if s.characteristics & IMAGE_SCN_MEM_EXECUTE]
+    for section in exec_sections:
+        blob = pe.data[section.raw_offset:section.raw_offset + section.raw_size]
+        cursor = 0
+        while (cursor := blob.find(b"\x48\x8d\x0d", cursor)) >= 0:
+            i = cursor
+            cursor += 1
+            if i + 7 > len(blob) or section.va + i + 7 + rel32(blob, i + 3) not in strings:
+                continue
+            call_ok = any(
+                blob[i + k:i + k + 2] == b"\xff\x15" and
+                writable_data(section.va + i + k + 6 + rel32(blob, i + k + 2))
+                for k in range(7, 24) if i + k + 6 <= len(blob))
+            if not call_ok:
+                continue
+            for back in range(7, 33):
+                j = i - back
+                if j < 0 or blob[j:j + 3] != b"\x48\x8d\x15":
+                    continue
+                target = section.va + j + 7 + rel32(blob, j + 3)
+                if writable_data(target):
+                    slots.add(target)
+                    break
+    if len(slots) != 1:
+        return None
+    slot = slots.pop()
+
+    resolvers: set[int] = set()
+    for section in exec_sections:
+        blob = pe.data[section.raw_offset:section.raw_offset + section.raw_size]
+        cursor = 0
+        while (cursor := blob.find(b"\x48\x8b\x05", cursor)) >= 0:
+            i = cursor
+            cursor += 1
+            if i + 7 > len(blob) or section.va + i + 7 + rel32(blob, i + 3) != slot:
+                continue
+            for k in range(7, 32):
+                if i + k + 5 > len(blob) or blob[i + k] != 0xE8:
+                    continue
+                target = section.va + i + k + 5 + rel32(blob, i + k + 1)
+                ts = section_for(pe, target, 48)
+                if not ts or not ts.characteristics & IMAGE_SCN_MEM_EXECUTE:
+                    continue
+                body = pe.data[pe.rva_to_offset(target):pe.rva_to_offset(target) + 48]
+                if body.startswith(RESOLVER_PREFIX) and b"\xff\x15" in body[:40] and b"\xc3" in body:
+                    resolvers.add(target)
+                    break
+    if len(resolvers) != 1:
+        return None
+    return resolvers.pop(), slot
+
+
 def count_fatbins(data: bytes) -> tuple[int, int, int]:
     magic = b"\x50\xed\x55\xba"
     valid = sm89 = sm120 = 0
@@ -150,6 +242,8 @@ def main() -> None:
         f"cmp_imm=+0x{cmp_rva:x},setge=+0x{setge_rva:x}" for cmp_rva, setge_rva in gates))
     print(f"config={f'+0x{config:x}' if config is not None else 'missing'}")
     print(f"fatbins={fatbins} sm89_entries={sm89} sm120_entries={sm120}")
+    lazy = find_cudart_lazy_slot(pe, "cuModuleLoadData")
+    print("cudart_lazy=" + (f"resolver=+0x{lazy[0]:x},slot=+0x{lazy[1]:x}" if lazy else "missing"))
     if init_rva is None or len(gates) != 1 or config is None:
         raise SystemExit(2)
 

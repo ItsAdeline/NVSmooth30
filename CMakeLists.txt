@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(NVSmooth30 VERSION 0.1.0 LANGUAGES CXX)
+project(NVSmooth30 VERSION 0.1.1 LANGUAGES CXX)
 
 if(NOT WIN32 OR NOT MSVC)
   message(FATAL_ERROR "NVSmooth30 currently targets 64-bit Windows with MSVC")
