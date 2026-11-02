@@ -229,6 +229,176 @@ std::byte* find_config(NvpInitD3D init) {
     return nullptr;
 }
 
+// --- Statically-linked CUDA runtime (cudart) lazy driver table -------------
+//
+// NvPresent links cudart statically. cudart loads nvcuda.dll on first use and
+// fills a table of driver entry points through cuGetProcAddress_v2, so there
+// is no nvcuda import and GetProcAddress is never asked for
+// "cuModuleLoadData". Each driver call goes through a small wrapper:
+//
+//     mov  rax, [rip+slot]        ; 48 8B 05 rel32
+//     ...  test rax,rax / jnz
+//     call resolver               ; E8 rel32  (InitOnceExecuteOnce stub)
+//     ...  jmp rax
+//
+// and the table is filled by code of the form:
+//
+//     lea  rdx, [rip+slot]        ; 48 8D 15 rel32
+//     lea  rcx, [rip+"name"]      ; 48 8D 0D rel32
+//     call [rip+cuGetProcAddress] ; FF 15 rel32
+//
+// The 0.1 release only handled this through hard-coded RVAs for one 616.xx
+// build. R620 drivers (621.01+) move both the resolver and the slot, so the
+// hook silently fell through to the GetProcAddress last resort, which never
+// fires for cudart. This locates both structurally on any build and fails
+// closed unless exactly one slot and one resolver are found.
+
+constexpr std::array<std::byte, 8> kCudartResolverPrefix{
+    std::byte{0x48}, std::byte{0x83}, std::byte{0xec}, std::byte{0x28},
+    std::byte{0x45}, std::byte{0x33}, std::byte{0xc9}, std::byte{0x48}
+};
+
+struct CudartLazySlot {
+    std::byte* resolver{};
+    void** slot{};
+};
+
+const std::byte* rip_target(const std::byte* instruction, std::size_t displacement_offset,
+                            std::size_t instruction_length) {
+    std::int32_t displacement{};
+    std::memcpy(&displacement, instruction + displacement_offset, sizeof(displacement));
+    return instruction + instruction_length + displacement;
+}
+
+bool range_in_section(const void* address, std::size_t bytes, DWORD required, DWORD forbidden) {
+    const auto* p = reinterpret_cast<const std::byte*>(address);
+    for (const auto& section : pe::sections(g_nvp)) {
+        if ((section.characteristics & required) != required) continue;
+        if (section.characteristics & forbidden) continue;
+        if (p >= section.begin && bytes <= section.size &&
+            p <= section.begin + section.size - bytes)
+            return true;
+    }
+    return false;
+}
+
+bool writable_data_slot(const void* address) {
+    return (reinterpret_cast<std::uintptr_t>(address) % alignof(void*)) == 0 &&
+           range_in_section(address, sizeof(void*), IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE,
+                            IMAGE_SCN_MEM_EXECUTE);
+}
+
+std::optional<CudartLazySlot> find_cudart_lazy_slot(std::string_view symbol) {
+    // 1. Exact NUL-terminated name at a string boundary in read-only data.
+    std::vector<const std::byte*> names;
+    for (const auto& section : pe::sections(g_nvp)) {
+        if (!(section.characteristics & IMAGE_SCN_MEM_READ) ||
+            (section.characteristics & IMAGE_SCN_MEM_EXECUTE) ||
+            section.size <= symbol.size())
+            continue;
+        const auto* begin = reinterpret_cast<const char*>(section.begin);
+        for (std::size_t i = 0; i + symbol.size() < section.size; ++i) {
+            if (begin[i + symbol.size()] != '\0') continue;
+            if (std::memcmp(begin + i, symbol.data(), symbol.size()) != 0) continue;
+            if (i != 0 && begin[i - 1] != '\0') continue;
+            names.push_back(section.begin + i);
+        }
+    }
+    if (names.empty()) return std::nullopt;
+
+    std::vector<const std::byte*> executable_begin;
+    std::vector<std::size_t> executable_size;
+    for (const auto& section : pe::sections(g_nvp)) {
+        if (!(section.characteristics & IMAGE_SCN_MEM_EXECUTE) || section.size < 16) continue;
+        executable_begin.push_back(section.begin);
+        executable_size.push_back(section.size);
+    }
+
+    // 2. lea rcx,[name] with a cuGetProcAddress-style call after it and a
+    //    lea rdx,[slot] into writable data shortly before it.
+    void** slot{};
+    for (std::size_t s = 0; s < executable_begin.size(); ++s) {
+        const auto* code = executable_begin[s];
+        const std::size_t size = executable_size[s];
+        for (std::size_t i = 0; i + 7 <= size; ++i) {
+            if (code[i] != std::byte{0x48} || code[i + 1] != std::byte{0x8d} ||
+                code[i + 2] != std::byte{0x0d})
+                continue;
+            const auto* target = rip_target(code + i, 3, 7);
+            if (std::find(names.begin(), names.end(), target) == names.end()) continue;
+
+            bool call_follows = false;
+            for (std::size_t k = 7; k < 24 && i + k + 6 <= size; ++k) {
+                if (code[i + k] == std::byte{0xff} && code[i + k + 1] == std::byte{0x15} &&
+                    writable_data_slot(rip_target(code + i + k, 2, 6))) {
+                    call_follows = true;
+                    break;
+                }
+            }
+            if (!call_follows) continue;
+
+            for (std::size_t back = 7; back <= 32 && back <= i; ++back) {
+                const std::size_t j = i - back;
+                if (code[j] != std::byte{0x48} || code[j + 1] != std::byte{0x8d} ||
+                    code[j + 2] != std::byte{0x15})
+                    continue;
+                auto* candidate = const_cast<std::byte*>(rip_target(code + j, 3, 7));
+                if (!writable_data_slot(candidate)) continue;
+                auto** candidate_slot = reinterpret_cast<void**>(candidate);
+                if (slot && slot != candidate_slot) {
+                    logf("[nvs30] cudart lazy slot ambiguous for %.*s; skipping.\n",
+                         static_cast<int>(symbol.size()), symbol.data());
+                    return std::nullopt;
+                }
+                slot = candidate_slot;
+                break;
+            }
+        }
+    }
+    if (!slot) return std::nullopt;
+
+    // 3. The wrapper that loads this slot calls the lazy resolver when it is
+    //    still null. Validate the resolver's InitOnceExecuteOnce stub shape.
+    std::byte* resolver{};
+    for (std::size_t s = 0; s < executable_begin.size(); ++s) {
+        const auto* code = executable_begin[s];
+        const std::size_t size = executable_size[s];
+        for (std::size_t i = 0; i + 7 <= size; ++i) {
+            if (code[i] != std::byte{0x48} || code[i + 1] != std::byte{0x8b} ||
+                code[i + 2] != std::byte{0x05})
+                continue;
+            if (rip_target(code + i, 3, 7) != reinterpret_cast<const std::byte*>(slot)) continue;
+
+            for (std::size_t k = 7; k < 32 && i + k + 5 <= size; ++k) {
+                if (code[i + k] != std::byte{0xe8}) continue;
+                auto* candidate = const_cast<std::byte*>(rip_target(code + i + k, 1, 5));
+                if (!range_in_section(candidate, 48, IMAGE_SCN_MEM_EXECUTE, 0)) continue;
+                if (std::memcmp(candidate, kCudartResolverPrefix.data(),
+                                kCudartResolverPrefix.size()) != 0)
+                    continue;
+                bool has_indirect_call = false;
+                bool has_ret = false;
+                for (std::size_t b = 0; b + 1 < 48; ++b) {
+                    if (b + 1 < 40 && candidate[b] == std::byte{0xff} &&
+                        candidate[b + 1] == std::byte{0x15})
+                        has_indirect_call = true;
+                    if (candidate[b] == std::byte{0xc3}) has_ret = true;
+                }
+                if (!has_indirect_call || !has_ret) continue;
+                if (resolver && resolver != candidate) {
+                    logf("[nvs30] cudart lazy resolver ambiguous for %.*s; skipping.\n",
+                         static_cast<int>(symbol.size()), symbol.data());
+                    return std::nullopt;
+                }
+                resolver = candidate;
+                break;
+            }
+        }
+    }
+    if (!resolver) return std::nullopt;
+    return CudartLazySlot{resolver, slot};
+}
+
 int WINAPI hooked_cu_module_load_data(void** module_out, const void* image) {
     if (!g_real_cu_load) return 3;
     std::scoped_lock lock(g_cuda_mutex);
@@ -344,6 +514,32 @@ bool install_cuda_hook(const GateMatch& discovered_gate, const std::byte* discov
                 logf("[nvs30] reference CUDA fallback signature not present; continuing generic discovery.\n");
             }
         }
+    }
+
+    // Same mechanism as the reference fallback above, but located
+    // structurally so it survives driver updates (R620 / 621.01 and later).
+    if (auto lazy = find_cudart_lazy_slot("cuModuleLoadData")) {
+        logf("[nvs30] cudart lazy table located dynamically: resolver=+0x%zx slot=+0x%zx.\n",
+             module_offset(lazy->resolver), module_offset(lazy->slot));
+        using LazyResolver = int (WINAPI*)();
+        const int resolver_rc = reinterpret_cast<LazyResolver>(lazy->resolver)();
+        if (resolver_rc == 0 && *lazy->slot) {
+            g_real_cu_load = reinterpret_cast<CuModuleLoadData>(*lazy->slot);
+            if (pe::write_pointer(lazy->slot, reinterpret_cast<void*>(&hooked_cu_module_load_data))) {
+                g_cuda_slots.push_back(lazy->slot);
+                logf("[nvs30] cuModuleLoadData cudart slot hooked: +0x%zx (dynamic lazy-table path).\n",
+                     module_offset(lazy->slot));
+                return true;
+            }
+            logf("[nvs30] cudart slot +0x%zx found but could not be patched.\n",
+                 module_offset(lazy->slot));
+            g_real_cu_load = nullptr;
+        } else {
+            logf("[nvs30] cudart lazy resolver did not populate the slot: rc=%d slot=%p.\n",
+                 resolver_rc, *lazy->slot);
+        }
+    } else if (config().diagnostics) {
+        logf("[nvs30] cudart lazy table not found; continuing generic discovery.\n");
     }
 
     // Newer/previously-initialized NvPresent builds can have the CUDA entry
